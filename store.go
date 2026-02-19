@@ -1,6 +1,7 @@
 package main
 import (
 	"net/http"
+	"errors"
 )
 
 var store = make(map[string]any) // persitantce store in memory for now
@@ -14,17 +15,25 @@ func main() {
 
 
 func get(key string) (string, error) {
-	return "", nil
+	value, exists := store[key]
+	if !exists {
+		return "", errors.New("key not found")
+	}
+	return value, nil
 }
 
 
-func put(key string, value string) error{
-
-	return nil
+func put(key string, value string) {
+	store[key] = value
 }
 
 
 func delete(key string) error{
+	value, exists := store[key]
+	if !exists {
+		return errors.New("key not found")
+	}
+	delete(store, key)
 	return nil
 }
 
