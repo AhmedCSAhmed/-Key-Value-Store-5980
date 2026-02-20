@@ -24,9 +24,9 @@ func main() {
 		panic(err)
 	}
 	server()
-	slog.Info("Server is listening on localhost:8090")
+	slog.Info("Server is listening on localhost:8080")
 
-	http.ListenAndServe(":8090", nil)
+	http.ListenAndServe(":8080", nil)
 }
 
 func loadFromFile() error {
