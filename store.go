@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"os"
 	"sync"
+	"strings"
 )
 
 const storeFile = "store.json"
@@ -138,15 +139,14 @@ func server() {
 	})
 
 	http.HandleFunc("/put", func(w http.ResponseWriter, r *http.Request) {
-		key := r.URL.Query().Get("key")
-		value := r.URL.Query().Get("value")
+		parts := strings.Split(r.URL.Path, "/")
+		key := parts[2]
 		slog.Info(
 			"/put called",
 			"key", key,
-			"value_present", value != "",
 			"remote", r.RemoteAddr,
 		)
-		if key == "" || value == "" {
+		if key == "" {
 			slog.Warn("invalid put request", "key", key)
 
 			http.Error(w, "key and value are required and cannot be empty", http.StatusBadRequest)
@@ -164,7 +164,9 @@ func server() {
 	})
 
 	http.HandleFunc("/delete", func(w http.ResponseWriter, r *http.Request) {
-		key := r.URL.Query().Get("key")
+		parts := strings.Split(r.URL.Path, "/")
+		key := parts[2]
+
 		slog.Info("/delete called", "key", key, "remote", r.RemoteAddr)
 
 		if key == "" {
