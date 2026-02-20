@@ -1,72 +1,64 @@
 package main
 
 import (
+	"encoding/gob"
 	"encoding/json"
 	"errors"
 	"log/slog"
 	"net/http"
 	"os"
-	"sync"
 	"strings"
+	"sync"
 )
 
-const storeFile = "store.json"
+const storeFile = "store.bin"
 
 var (
-	store          = make(map[string]string)
-	mu             sync.Mutex
+	store = make(map[string]string)
+	mu sync.Mutex
 	ErrKeyNotFound = errors.New("key not found")
 )
 
 func main() {
-	if err := loadFromFile(); err != nil && !os.IsNotExist(err) {
+	err := loadFromFile()
+	if err != nil && !os.IsNotExist(err) {
 		slog.Error("Server failed to start", "error", err)
 
 		panic(err)
 	}
 	server()
-	slog.Info("Server is listening on localhost:8080")
+	slog.Info("Server is listening on localhost:8090")
 
-	http.ListenAndServe(":8080", nil)
+	http.ListenAndServe(":8090", nil)
 }
 
 func loadFromFile() error {
-	data, err := os.ReadFile(storeFile)
+	f, err := os.Open(storeFile)
 	if err != nil {
-		slog.Error(
-			"failed to read store file",
-			"file", storeFile,
-			"error", err,
-		)
 		return err
 	}
+	defer f.Close()
 	mu.Lock()
 	defer mu.Unlock()
-	slog.Info(
-		"store loaded successfully",
-		"file", storeFile,
-		"entries", len(store),
-	)
-	return json.Unmarshal(data, &store)
+	if err = gob.NewDecoder(f).Decode(&store); err != nil {
+		return err
+	}
+	slog.Info("store loaded from file", "file", storeFile, "entries", len(store))
+	return nil
 }
 
 func saveToFile() error {
-	data, err := json.MarshalIndent(store, "", "  ")
+	// Caller holds mu
+	f, err := os.Create(storeFile)
 	if err != nil {
-		slog.Error(
-			"failed to marshal store",
-			"entries", len(store),
-			"error", err,
-		)
 		return err
 	}
-	slog.Info(
-		"store saved successfully",
-		"file", storeFile,
-		"entries", len(store),
-	)
-
-	return os.WriteFile(storeFile, data, 0644)
+	defer f.Close()
+	if err := gob.NewEncoder(f).Encode(store); err != nil {
+		return err
+	}
+	slog.Info("store saved to file", "file", storeFile, "entries", len(store))
+	return nil
 }
 
 func get(key string) (string, error) {
@@ -113,19 +105,50 @@ func deleteVal(key string) error {
 }
 
 func server() {
+	http.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
+		key := strings.TrimPrefix(r.URL.Path, "/")
+		if key == "" {
+			return 
+		}
+		switch r.Method {
+		case http.MethodGet:
+			w.Header().Set("Content-Type", "text/plain; charset=utf-8")
+			value, err := get(key)
+			if err != nil {
+				if errors.Is(err, ErrKeyNotFound) {
+					http.Error(w, "key not found", http.StatusNotFound)
+				} else {
+					http.Error(w, "internal server error", http.StatusInternalServerError)
+				}
+				return
+			}
+			w.WriteHeader(http.StatusOK)
+			w.Write([]byte(value))
+		case http.MethodPost:
+			var payload struct {
+				Value string `json:"value"`
+			}
+			if err := json.NewDecoder(r.Body).Decode(&payload); err != nil {
+				http.Error(w, "invalid JSON", http.StatusBadRequest)
+				return
+			}
+			if err := put(key, payload.Value); err != nil {
+				http.Error(w, "internal server error", http.StatusInternalServerError)
+				return
+			}
+			w.WriteHeader(http.StatusOK)
+			w.Write([]byte("ok"))
+		}
+	})
 
 	http.HandleFunc("/get", func(w http.ResponseWriter, r *http.Request) {
-		resp := r.URL.Query().Get("key")
-		slog.Info("/get called", "key", resp, "remote", r.RemoteAddr)
-
-		if resp == "" {
-
+		key := r.URL.Query().Get("key")
+		if key == "" {
 			http.Error(w, "key is required and cannot be empty", http.StatusBadRequest)
 			return
 		}
-
 		w.Header().Set("Content-Type", "text/plain; charset=utf-8")
-		value, err := get(resp)
+		value, err := get(key)
 		if err != nil {
 			if errors.Is(err, ErrKeyNotFound) {
 				http.Error(w, "key not found", http.StatusNotFound)
@@ -139,23 +162,13 @@ func server() {
 	})
 
 	http.HandleFunc("/put", func(w http.ResponseWriter, r *http.Request) {
-		parts := strings.Split(r.URL.Path, "/")
-		key := parts[2]
-		slog.Info(
-			"/put called",
-			"key", key,
-			"remote", r.RemoteAddr,
-		)
-		if key == "" {
-			slog.Warn("invalid put request", "key", key)
-
+		key := r.URL.Query().Get("key")
+		value := r.URL.Query().Get("value")
+		if key == "" || value == "" {
 			http.Error(w, "key and value are required and cannot be empty", http.StatusBadRequest)
 			return
 		}
-
-		err := put(key, value)
-
-		if err != nil {
+		if err := put(key, value); err != nil {
 			http.Error(w, "internal server error", http.StatusInternalServerError)
 			return
 		}
@@ -164,17 +177,12 @@ func server() {
 	})
 
 	http.HandleFunc("/delete", func(w http.ResponseWriter, r *http.Request) {
-		parts := strings.Split(r.URL.Path, "/")
-		key := parts[2]
-
-		slog.Info("/delete called", "key", key, "remote", r.RemoteAddr)
-
+		key := r.URL.Query().Get("key")
 		if key == "" {
 			http.Error(w, "key is required and cannot be empty", http.StatusBadRequest)
 			return
 		}
-		err := deleteVal(key)
-		if err != nil {
+		if err := deleteVal(key); err != nil {
 			http.Error(w, "internal server error", http.StatusInternalServerError)
 			return
 		}
