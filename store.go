@@ -10,6 +10,7 @@ import (
 	"strings"
 	"sync"
 	"syscall"
+	"golang.org/x/sys/unix"
 )
 
 const (
@@ -128,6 +129,10 @@ func put(key string, value string) error {
 		"value", value,
 		"size", len(idx),
 	)
+	if err := unix.Msync(data, unix.MS_SYNC); err != nil { // Synchronizes mmaps with disk storage and makes sure writes to actual file
+		slog.Error("msync failed", "error", err)
+		return err
+	}
 	return nil
 }
 
