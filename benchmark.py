@@ -66,11 +66,14 @@ def monitor_performance():
         last_print = time.time()
 
 # Populate the operation queue with mixed 'set' and 'get' requests
+# MAIN CHANGE: Made sure set operations were done then we could go get requests on those within the store already
 for i in range(NUM_THREADS * OPS_PER_THREAD):
-    op_type = 'get' if i % 2 else 'set'
     key = f"key_{i}"
-    value = f"value_{i}" if op_type == 'set' else None
-    operations_queue.put((op_type, key, value))
+    value = f"value_{i}"
+    operations_queue.put(('set', key, value))
+for j in range(NUM_THREADS * OPS_PER_THREAD):
+    key = f"key_{j}"
+    operations_queue.put(('get', key, None))
 
 # Create and start worker threads
 threads = [threading.Thread(target=worker_thread) for _ in range(NUM_THREADS)]
