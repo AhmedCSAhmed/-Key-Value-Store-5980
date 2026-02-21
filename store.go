@@ -1,7 +1,7 @@
 package main
 
 import (
-	"encoding/gob"
+	"encoding/binary"
 	"encoding/json"
 	"errors"
 	"log/slog"
@@ -9,20 +9,26 @@ import (
 	"os"
 	"strings"
 	"sync"
+	"syscall"
 )
 
-const storeFile = "store.bin"
+const (
+	storeMmapFile = "store.mmap"    // mmap since can modify in-disk memory compared to doing a full file rewrite and no encode and decode (O(1) appending)
+	maxSize       = 1024 * 1024 * 8 // Max size for virtual address space in mmap file when mapping
+)
 
 var (
-	store = make(map[string]string)
-	mu sync.Mutex
-	ErrKeyNotFound = errors.New("key not found")
+	idx             = map[string]int{} // key -> offset
+	writingPosition int                // Append offset for specifically finding starting point of .mmap file
+	mu              sync.Mutex
+	ErrKeyNotFound  = errors.New("key not found")
+	data            []byte // mmap'd file (file on disk assigned within virtual memory by an address range)
 )
 
 func main() {
-	err := loadFromFile()
+	err := initalize_map()
 	if err != nil && !os.IsNotExist(err) {
-		slog.Error("Server failed to start", "error", err)
+		slog.Error("Failed to initalize mem mapping", "error", err)
 
 		panic(err)
 	}
@@ -32,83 +38,113 @@ func main() {
 	http.ListenAndServe(":8090", nil)
 }
 
-func loadFromFile() error {
-	f, err := os.Open(storeFile)
+func initalize_map() error { // Setup mmap permissions and file
+	file, err := os.OpenFile(storeMmapFile, os.O_RDWR|os.O_CREATE, 0644) // 644 - Root User (r and w), Rest (reads) and creation of file on OS
 	if err != nil {
 		return err
 	}
-	defer f.Close()
-	mu.Lock()
-	defer mu.Unlock()
-	if err = gob.NewDecoder(f).Decode(&store); err != nil {
+	defer file.Close()
+	if err := file.Truncate(maxSize); err != nil { // shrinks the file to address maxSize
 		return err
 	}
-	slog.Info("store loaded from file", "file", storeFile, "entries", len(store))
+	data, err = syscall.Mmap(
+		int(file.Fd()),
+		// File descriptor in file
+		0,
+		maxSize,
+		syscall.PROT_READ|syscall.PROT_WRITE,
+		syscall.MAP_SHARED, // Changes are shared with other processes mapping into the same file, later written to disk file
+	)
+	if err != nil {
+		return err
+	}
+	fix_Idx()
+	slog.Info("mmap initialized", "entries", len(idx))
 	return nil
+
 }
 
-func saveToFile() error {
-	// Caller holds mu
-	f, err := os.Create(storeFile)
-	if err != nil {
-		return err
+func fix_Idx() { // Recover Idx in file when writing during the mapping process after kv-store operations
+	file_position := 0
+	for file_position+8 <= maxSize {
+		key_len := int(binary.LittleEndian.Uint32(data[file_position:]))
+		value_len := int(binary.LittleEndian.Uint32(data[file_position+4:]))
+		if key_len == 0 && value_len == 0 {
+			break
+		}
+		key_start := file_position + 8
+		value_start := key_start + key_len // After writing the key thats where start writing value of that kv pair
+		key := string(data[key_start : key_start+key_len])
+		idx[key] = file_position
+		file_position = value_start + value_len // After writing kv pair and doing operation
 	}
-	defer f.Close()
-	if err := gob.NewEncoder(f).Encode(store); err != nil {
-		return err
-	}
-	slog.Info("store saved to file", "file", storeFile, "entries", len(store))
-	return nil
+	writingPosition = file_position // Rebuilding spot where a new kv pair would be written to file
+
 }
 
 func get(key string) (string, error) {
 
 	mu.Lock()
 	defer mu.Unlock()
-	value, exists := store[key]
-	if !exists {
-		slog.Warn("get failed: key not found", "key", key)
 
+	off, ok := idx[key]
+	if !ok {
 		return "", ErrKeyNotFound
 	}
-	slog.Info("get successful", "key", key, "value", value)
-	return value, nil
+
+	klen := int(binary.LittleEndian.Uint32(data[off:]))
+	vlen := int(binary.LittleEndian.Uint32(data[off+4:]))
+
+	valStart := off + 8 + klen
+	value := string(data[valStart : valStart+vlen]) // Actual val in KV store
+
+	slog.Info("get request called", "key", key, "value", value, "Length", len(idx))
+
+	return string(data[valStart : valStart+vlen]), nil
 }
 
 func put(key string, value string) error {
-	slog.Info(
-		"put request received",
-		"key", key,
-		"value_size", len(value),
-	)
 	mu.Lock()
 	defer mu.Unlock()
-	store[key] = value
-	slog.Info("put successful", "key", key)
 
-	return saveToFile()
+	klen := len(key)
+	vlen := len(value)
+	recordSize := 8 + klen + vlen
+
+	if writingPosition+recordSize > maxSize {
+		return errors.New("store full")
+	}
+
+	binary.LittleEndian.PutUint32(data[writingPosition:], uint32(klen))
+	binary.LittleEndian.PutUint32(data[writingPosition+4:], uint32(vlen))
+	copy(data[writingPosition+8:], key)
+	copy(data[writingPosition+8+klen:], value)
+
+	idx[key] = writingPosition
+	writingPosition += recordSize
+	slog.Info(
+		"put request called",
+		"key", key,
+		"value", value,
+		"size", len(idx),
+	)
+	return nil
 }
 
 func deleteVal(key string) error {
 	mu.Lock()
 	defer mu.Unlock()
-	_, exists := store[key]
-	if !exists {
-		slog.Warn("delete failed: key not found", "key", key)
-
-		return ErrKeyNotFound
-	}
-	delete(store, key)
+	delete(idx, key)
 	slog.Info("delete successful", "key", key)
 
-	return saveToFile()
+	return nil
 }
 
 func server() {
 	http.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
 		key := strings.TrimPrefix(r.URL.Path, "/")
 		if key == "" {
-			return 
+			return
 		}
 		switch r.Method {
 		case http.MethodGet:
