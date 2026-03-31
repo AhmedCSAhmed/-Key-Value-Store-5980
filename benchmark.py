@@ -2,26 +2,34 @@ import threading
 import queue
 import requests
 import time
-import random
+import argparse
 
-# The base URL of the Flask server
-NODES = [
-    'http://127.0.0.1:8090',
-    'http://127.0.0.1:8091',
-    'http://127.0.0.1:8092',
-] # For Consistent Hashing of KV store nodes
+parser = argparse.ArgumentParser()
+parser.add_argument('--port', type=int, default=8090, help='base port of the first KV node')
+parser.add_argument('--num-servers', type=int, default=3, help='number of KV nodes')
+args = parser.parse_args()
+
+NODES = [f'http://127.0.0.1:{args.port + i}' for i in range(args.num_servers)]
 
 def get_specific_node_key(idx):
     return NODES[idx % len(NODES)]
 
 # Configure the number of threads and operations
-NUM_THREADS = 3
-OPS_PER_THREAD = 100
+NUM_THREADS = 5
+OPS_PER_THREAD = 1000
 PRINT_INTERVAL = 3  # Interval for printing intermediate results
 
 # Queues for managing operations and latencies
 operations_queue = queue.Queue()
 latencies_queue = queue.Queue()
+node_stats_lock = threading.Lock()
+node_stats = {
+    idx: {
+        'successes': 0,
+        'latency_sum': 0.0,
+    }
+    for idx in range(len(NODES))
+}
 
 # Synchronize the starting of threads
 start_event = threading.Event()
@@ -54,6 +62,9 @@ def worker_thread():
         if kv_store_operation(op, key, value, node_index):
             latency = time.time() - start_time
             latencies_queue.put(latency)
+            with node_stats_lock:
+                node_stats[node_index]['successes'] += 1
+                node_stats[node_index]['latency_sum'] += latency
 
 # Monitoring thread function
 def monitor_performance():
@@ -77,11 +88,11 @@ def monitor_performance():
 for i in range(NUM_THREADS * OPS_PER_THREAD):
     key = f"key_{i}"
     value = f"value_{i}"
-    node_idx = i & len(NODES)
+    node_idx = i % len(NODES)
     operations_queue.put(('set', key, value, node_idx))
 for j in range(NUM_THREADS * OPS_PER_THREAD):
     key = f"key_{j}"
-    node_idx = j & len(NODES)
+    node_idx = j % len(NODES)
     operations_queue.put(('get', key, None, node_idx))
 
 # Create and start worker threads
@@ -114,3 +125,17 @@ print(f"Total time: {total_time:.2f} seconds")
 print(f"Throughput: {throughput:.2f} operations per second")
 print(f"Average Latency: {average_latency:.5f} seconds per operation")
 
+print("\nPer-Node Final Results:")
+for idx, node_url in enumerate(NODES):
+    successes = node_stats[idx]['successes']
+    avg_node_latency = (
+        node_stats[idx]['latency_sum'] / successes
+        if successes else float('nan')
+    )
+    node_throughput = successes / total_time if total_time > 0 else float('nan')
+
+    print(f"\nNode {idx + 1} ({node_url}):")
+    print(f"Total operations: {successes}")
+    print(f"Total time: {total_time:.2f} seconds")
+    print(f"Throughput: {node_throughput:.2f} operations per second")
+    print(f"Average Latency: {avg_node_latency:.5f} seconds per operation")

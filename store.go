@@ -35,28 +35,24 @@ var ErrKeyNotFound = errors.New("key not found")
 // docker run -d -e NODE_NAME=kvNode3 -e PORT=8093 --name kv3 -p 8093:8093 kvstore:latest
 
 func main() {
-	
-	nodes := []*ServerNode {
-		{name: "kvNode1", node_store: make(map[string]string)},
-		{name: "kvNode2", node_store: make(map[string]string)},
-		{name: "kvNode3", node_store: make(map[string]string)},
-	}
-	server_nodes = nodes
-	con_hash = newConsistentHashDS(3) // 3 node instances
-	for _, n := range nodes {
-		if err := n.loadFromFile(); err != nil && !os.IsNotExist(err){
-		slog.Error("failed to load node store", "node", n.name, "error", err)
-		}
-		con_hash.addServer(n.name)
-	}
-	server()
 	port := flag.String("port", "8090", "port to listen on")
-    flag.Parse()
+	nodeName := flag.String("node", "kvNode1", "node name")
+	flag.Parse()
+
+	node := &ServerNode{name: *nodeName, node_store: make(map[string]string)}
+	server_nodes = []*ServerNode{node}
+	con_hash = newConsistentHashDS(3)
+	if err := node.loadFromFile(); err != nil && !os.IsNotExist(err) {
+		slog.Error("failed to load node store", "node", node.name, "error", err)
+	}
+	con_hash.addServer(node.name)
+
+	server()
+
 	addr := ":" + *port
 	slog.Info("Server is listening on", "port", *port)
-
- 	if err := http.ListenAndServe(addr, nil); err != nil {
-        slog.Error("Server failed", "error", err)
+	if err := http.ListenAndServe(addr, nil); err != nil {
+		slog.Error("Server failed", "error", err)
 	}
 }
 
