@@ -1,17 +1,27 @@
 #!/bin/bash
 
-echo "Starting Go KV-store server..."
+PORT_DEF=${PORT:-8090}  # DEFAULT PORT
+NUM_KV=${NUM_KV:-1} # Number of KV stores
+echo "Starting Go KV-store servers..."
 
-go run store.go &
+for ((i=0; i<NUM_KV; i++)); do
+    PORT=$((PORT_DEF+ i))
+    echo "Starting server $i on port $PORT..."
 
-SERVER_PID=$!
+    # build server binary if not built yet
+    go build -o kvserver store.go hash_ring.go
 
-echo "Waiting for server to start..."
+    # start server in background
+    ./kvserver --port $PORT &
 
-until nc -z localhost 8090; do
-   sleep 2
+    SERVER_PID=$!
+    echo "Waiting for server $i to start on port $PORT..."
+    until nc -z localhost $PORT; do
+        sleep 1
+    done
+    echo "Server $i ready on $PORT."
 done
 
-echo "Server Ready, Starting benchmark..."
+echo "All servers are ready. Starting benchmark..."
+python3 benchmark.py --port $PORT_BASE --num-servers $NUM_KV
 
-python3 benchmark.py

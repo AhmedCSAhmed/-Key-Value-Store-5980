@@ -5,7 +5,14 @@ import time
 import random
 
 # The base URL of the Flask server
-BASE_URL = 'http://127.0.0.1:8090'
+NODES = [
+    'http://127.0.0.1:8090',
+    'http://127.0.0.1:8091',
+    'http://127.0.0.1:8092',
+] # For Consistent Hashing of KV store nodes
+
+def get_specific_node_key(idx):
+    return NODES[idx % len(NODES)]
 
 # Configure the number of threads and operations
 NUM_THREADS = 3
@@ -20,7 +27,8 @@ latencies_queue = queue.Queue()
 start_event = threading.Event()
 
 # Client operation function
-def kv_store_operation(op_type, key, value=None):
+def kv_store_operation(op_type, key, value=None, node_idx=0):
+    BASE_URL = get_specific_node_key(node_idx)
     try:
         if op_type == 'set':
             response = requests.post(f"{BASE_URL}/{key}", json={'value': value})
@@ -41,9 +49,9 @@ def worker_thread():
         pass
 
     while not operations_queue.empty():
-        op, key, value = operations_queue.get()
+        op, key, value, node_index = operations_queue.get()
         start_time = time.time()
-        if kv_store_operation(op, key, value):
+        if kv_store_operation(op, key, value, node_index):
             latency = time.time() - start_time
             latencies_queue.put(latency)
 
@@ -69,10 +77,12 @@ def monitor_performance():
 for i in range(NUM_THREADS * OPS_PER_THREAD):
     key = f"key_{i}"
     value = f"value_{i}"
-    operations_queue.put(('set', key, value))
+    node_idx = i & len(NODES)
+    operations_queue.put(('set', key, value, node_idx))
 for j in range(NUM_THREADS * OPS_PER_THREAD):
     key = f"key_{j}"
-    operations_queue.put(('get', key, None))
+    node_idx = j & len(NODES)
+    operations_queue.put(('get', key, None, node_idx))
 
 # Create and start worker threads
 threads = [threading.Thread(target=worker_thread) for _ in range(NUM_THREADS)]
