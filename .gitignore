@@ -27,7 +27,11 @@ dist/
 *.egg-info/
 *.egg
 
+# Go build cache
+.gocache/
+
 # Local data (if store persists to disk)
 *.db
 *.sqlite
 data/
+kvNode*.bin

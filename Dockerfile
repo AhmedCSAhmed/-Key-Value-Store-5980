@@ -1,4 +1,4 @@
-FROM golang:1.25-bookworm
+FROM golang:1.24-bookworm
 
 
 WORKDIR /-Key-Value-Store-5980
