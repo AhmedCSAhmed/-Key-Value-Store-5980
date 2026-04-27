@@ -27,6 +27,6 @@ COPY . .
 
 # Runs script to start server and benchmark testing for kv-store
 RUN chmod +x startup_script.sh
-
+RUN go build -o kvserver .
 
 CMD [ "bash", "startup_script.sh" ]

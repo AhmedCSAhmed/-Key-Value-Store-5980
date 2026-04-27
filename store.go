@@ -1,247 +1,224 @@
 package main
 
 import (
-	"encoding/gob"
-	"encoding/json"
 	"errors"
-	"log/slog"
 	"net/http"
-	"os"
-	"strings"
 	"sync"
-	"flag"
+	"sync/atomic"
+	"strings"
+	"encoding/json" 
 )
-
-const storeFile = "store.bin"
-
-
-type ServerNode struct {
-	name string 
-	node_store map[string] string 
-	mu sync.RWMutex
-}
-
-var (
-	server_nodes []*ServerNode // All server nodes
-	con_hash *ConsistentHashDS
-)
-
-var ErrKeyNotFound = errors.New("key not found")
 
 // Run docker for KV Store
 // docker build -t kvstore:latest .
-// docker run -d -e NODE_NAME=kvNode1 -e PORT=8091 --name kv1 -p 8091:8091 kvstore:latest
-// docker run -d -e NODE_NAME=kvNode2 -e PORT=8092 --name kv2 -p 8092:8092 kvstore:latest
-// docker run -d -e NODE_NAME=kvNode3 -e PORT=8093 --name kv3 -p 8093:8093 kvstore:latest
+// docker run -d \
+//   -e NODE_NAME=kvNode1 \
+//   -e PORT=8091 \
+//   -e PEERS=kvNode1,kvNode2,kvNode3 \
+//   -p 8091:8091 kvstore ./kvserver --node kvNode1 --port 8091
 
-func main() {
-	port := flag.String("port", "8090", "port to listen on")
-	nodeName := flag.String("node", "kvNode1", "node name")
-	flag.Parse()
+//   docker run -d \
+//   -e NODE_NAME=kvNode2 \
+//   -e PORT=8092 \
+//   -e PEERS=kvNode1,kvNode2,kvNode3 \
+//   -p 8092:8092 kvstore ./kvserver --node kvNode2 --port 8092
 
-	node := &ServerNode{name: *nodeName, node_store: make(map[string]string)}
-	server_nodes = []*ServerNode{node}
-	con_hash = newConsistentHashDS(3)
-	if err := node.loadFromFile(); err != nil && !os.IsNotExist(err) {
-		slog.Error("failed to load node store", "node", node.name, "error", err)
+//   docker run -d \
+//   -e NODE_NAME=kvNode3 \
+//   -e PORT=8093 \
+//   -e PEERS=kvNode1,kvNode2,kvNode3 \
+//   -p 8093:8093 kvstore ./kvserver --node kvNode3 --port 8093
+
+
+// docker logs kv1
+// docker logs kv2
+// docker logs kv3
+// Steps before demo:
+// 1. Possible move to TCP over HTTP
+// 2. Query param over JSON 
+// 3. Batch Processing
+
+var ErrKeyNotFound = errors.New("key not found")
+
+const numShards = 32
+var (
+	nodeMapMu sync.RWMutex
+	nodeMap   = make(map[string]*ServerNode)
+)
+type shard struct {
+	m  map[string]string
+	mu sync.RWMutex
+}
+
+type ServerNode struct {
+	name string
+
+	shards []shard
+
+	flushInterval any 
+	dirty         atomic.Bool
+	persistCh     chan struct{}
+	stopCh        chan struct{}
+	doneCh        chan struct{}
+}
+
+
+
+
+func newServerNode(name string) *ServerNode {
+	shards := make([]shard, numShards)
+	for i := range shards {
+		shards[i].m = make(map[string]string)
 	}
-	con_hash.addServer(node.name)
 
-	server()
-
-	addr := ":" + *port
-	slog.Info("Server is listening on", "port", *port)
-	if err := http.ListenAndServe(addr, nil); err != nil {
-		slog.Error("Server failed", "error", err)
+	return &ServerNode{
+		name:   name,
+		shards: shards,
 	}
 }
 
-func (n *ServerNode) loadFromFile() error {
-	f, err := os.Open(n.name + ".bin")
-	if err != nil {
-		return err
-	}
-	defer f.Close()
-	n.mu.Lock()
-	defer n.mu.Unlock()
-	if err = gob.NewDecoder(f).Decode(&n.node_store); err != nil {
-		return err
-	}
-	slog.Info("node store loaded", "node", n.name, "node entries", len(n.node_store))
-	return nil
+
+func (n *ServerNode) shardIndex(key string) int {
+	return int(hash_method(key)) % numShards
 }
 
-func (n *ServerNode) saveToFile() error {
-	f, err := os.Create(n.name + ".bin")
-	if err != nil {
-		return err
-	}
-	defer f.Close()
-	if err := gob.NewEncoder(f).Encode(n.node_store); err != nil {
-		return err
-	}
-	slog.Info("node store saved", "node", n.name, "node entries", len(n.node_store))
-	return nil
+
+func route(key string) *ServerNode {
+	nodeName := con_hash.getServerbyKey(key)
+
+	nodeMapMu.RLock()
+	defer nodeMapMu.RUnlock()
+
+	return nodeMap[nodeName]
 }
 
-func getServerKey(server_key string, nodes []*ServerNode) *ServerNode {
-	serverName := con_hash.getServerbyKey(server_key)
-	for _, n := range nodes {
-		if n.name == serverName {
-			return n
-		}
-	}
-	return nil
 
-
-}
 
 func get(key string, nodes []*ServerNode) (string, error) {
-	n := getServerKey(key, nodes)
+	n := route(key)
 	if n == nil {
-		return "", errors.New("no node found for key")
+		return "", errors.New("no node found")
 	}
 
-	n.mu.RLock()
-	defer n.mu.RUnlock()
-	value, exists := n.node_store[key]
-	if !exists {
-		slog.Warn("get failed: key not found", "key", key)
+	s := &n.shards[n.shardIndex(key)]
+
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
+	val, ok := s.m[key]
+	if !ok {
 		return "", ErrKeyNotFound
 	}
-	slog.Info("get successful", "key", key, "value", value)
-	return value, nil
+	return val, nil
 }
 
-func put(key string, value string, nodes []*ServerNode) error {
-	n := getServerKey(key, nodes)
+
+func put(key, value string, nodes []*ServerNode) error {
+	n := route(key)
 	if n == nil {
-		return errors.New("no node found for key")
+		return errors.New("no node found")
 	}
 
-	slog.Info(
-		"put request received",
-		"key", key,
-		"value_size", len(value),
-		"node", n.name,
-	)
-	n.mu.Lock()
-	defer n.mu.Unlock()
-	n.node_store[key] = value
-	slog.Info("put successful", "key", key, "node", n.name)
+	s := &n.shards[n.shardIndex(key)]
 
-	if err := n.saveToFile(); err != nil {
-		slog.Error("failed to save node store", "node", n.name, "error", err)
-		return err
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.m[key] = value
+
+	return nil 
+}
+
+
+func deleteVal(key string, nodes []*ServerNode) error {
+	n := route(key)
+	if n == nil {
+		return errors.New("no node found")
 	}
+
+	s := &n.shards[n.shardIndex(key)]
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	if _, ok := s.m[key]; !ok {
+		return ErrKeyNotFound
+	}
+
+	delete(s.m, key)
 	return nil
 }
 
-func deleteVal(key string, nodes []*ServerNode) error {
-	n := getServerKey(key, nodes)
-	if n == nil {
-		return errors.New("no node found for key")
-	}
+func server(node *ServerNode) *http.ServeMux {
+	mux := http.NewServeMux()
 
-	n.mu.Lock()
-	defer n.mu.Unlock()
-	_, exists := n.node_store[key]
-	if !exists {
-		slog.Warn("delete failed: key not found", "key", key)
+	// KV handler: /<key>
+	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
 
-		return ErrKeyNotFound
-	}
-	delete(n.node_store, key)
-	slog.Info("delete successful", "key", key)
+		// avoid accidentally catching /healthz etc.
+		if r.URL.Path == "/" {
+			http.Error(w, "missing key", http.StatusBadRequest)
+			return
+		}
 
-	return n.saveToFile()
-}
-
-func server() {
-	http.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
 		key := strings.TrimPrefix(r.URL.Path, "/")
 		if key == "" {
-			return 
+			http.Error(w, "missing key", http.StatusBadRequest)
+			return
 		}
-		defer r.Body.Close()
+
 		switch r.Method {
+
 		case http.MethodGet:
-			w.Header().Set("Content-Type", "text/plain; charset=utf-8")
-			value, err := get(key, server_nodes)
+			val, err := get(key, server_nodes)
 			if err != nil {
-				if errors.Is(err, ErrKeyNotFound) {
-					http.Error(w, "key not found", http.StatusNotFound)
-				} else {
-					http.Error(w, "internal server error", http.StatusInternalServerError)
-				}
+				http.Error(w, err.Error(), http.StatusNotFound)
 				return
 			}
 			w.WriteHeader(http.StatusOK)
-			w.Write([]byte(value))
-			
+			w.Write([]byte(val))
+
 		case http.MethodPost:
-			var payload struct {
+			var body struct {
 				Value string `json:"value"`
 			}
-			if err := json.NewDecoder(r.Body).Decode(&payload); err != nil {
-				http.Error(w, "invalid JSON", http.StatusBadRequest)
+
+			if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+				http.Error(w, "invalid json body", http.StatusBadRequest)
 				return
 			}
-			if err := put(key, payload.Value, server_nodes); err != nil {
-				http.Error(w, "internal server error", http.StatusInternalServerError)
+
+			if body.Value == "" {
+				http.Error(w, "missing value", http.StatusBadRequest)
 				return
 			}
+
+			if err := put(key, body.Value, server_nodes); err != nil {
+				http.Error(w, "internal error", http.StatusInternalServerError)
+				return
+			}
+
 			w.WriteHeader(http.StatusOK)
 			w.Write([]byte("ok"))
-		}
-	})
 
-	http.HandleFunc("/get", func(w http.ResponseWriter, r *http.Request) {
-		key := r.URL.Query().Get("key")
-		if key == "" {
-			http.Error(w, "key is required and cannot be empty", http.StatusBadRequest)
-			return
-		}
-		w.Header().Set("Content-Type", "text/plain; charset=utf-8")
-		value, err := get(key, server_nodes)
-		if err != nil {
-			if errors.Is(err, ErrKeyNotFound) {
-				http.Error(w, "key not found", http.StatusNotFound)
-			} else {
-				http.Error(w, "internal server error", http.StatusInternalServerError)
+		case http.MethodDelete:
+			if err := deleteVal(key, server_nodes); err != nil {
+				http.Error(w, err.Error(), http.StatusNotFound)
+				return
 			}
-			return
+
+			w.WriteHeader(http.StatusOK)
+			w.Write([]byte("deleted"))
+
+		default:
+			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 		}
-		w.WriteHeader(http.StatusOK)
-		w.Write([]byte(value))
 	})
 
-	http.HandleFunc("/put", func(w http.ResponseWriter, r *http.Request) {
-		key := r.URL.Query().Get("key")
-		value := r.URL.Query().Get("value")
-		if key == "" || value == "" {
-			http.Error(w, "key and value are required and cannot be empty", http.StatusBadRequest)
-			return
-		}
-		if err := put(key, value, server_nodes); err != nil {
-			http.Error(w, "internal server error", http.StatusInternalServerError)
-			return
-		}
+	mux.HandleFunc("/healthz", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(http.StatusOK)
-		w.Write([]byte("key-value pair added successfully"))
+		w.Write([]byte(`{"status":"ok","node":"` + node.name + `"}`))
 	})
 
-	http.HandleFunc("/delete", func(w http.ResponseWriter, r *http.Request) {
-		key := r.URL.Query().Get("key")
-		if key == "" {
-			http.Error(w, "key is required and cannot be empty", http.StatusBadRequest)
-			return
-		}
-		if err := deleteVal(key, server_nodes); err != nil {
-			http.Error(w, "internal server error", http.StatusInternalServerError)
-			return
-		}
-		w.WriteHeader(http.StatusOK)
-		w.Write([]byte("key-value pair deleted successfully"))
-	})
+	return mux
 }
